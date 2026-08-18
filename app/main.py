@@ -2,23 +2,26 @@ from __future__ import annotations
 
 import json
 import logging
-import traceback
+import subprocess
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, Form, Header, HTTPException
+from fastapi import FastAPI, Form, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from app.config import AUTH_DISABLED, CORS_ORIGINS, PORT
+from app.config import AUTH_DISABLED, CORS_ORIGINS, PORT, ROOT_DIR
 from app.jobs import create_job, get_job, update_job
-from app.service import generate_package, output_dir_for
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Unable to Reach Letter Backend", version="1.0.0")
+JOB_SCRIPT = ROOT_DIR / "scripts" / "generate_unable_to_reach.py"
+
+app = FastAPI(title="Unable to Reach Letter Backend", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -29,10 +32,10 @@ app.add_middleware(
 
 
 class LetterPayload(BaseModel):
-    firstName: str = "ABHINAV"
-    lastName: str = "PULYANI"
-    clientName: str = "PULYANI, ABHINAV"
-    aNumber: str = "251566057"
+    firstName: str
+    lastName: str
+    clientName: str | None = None
+    aNumber: str
     language: str = "hindi"
     addr_code: str = "add1"
     date: str | None = None
@@ -55,34 +58,36 @@ def _parse_data_json(data_json: str) -> dict[str, Any]:
     return data
 
 
-def _run_job(job_id: str, payload: dict[str, Any]) -> None:
+def _start_pdf_job(job_id: str) -> None:
+    if not JOB_SCRIPT.exists():
+        update_job(job_id, status="failed", progress=100, error="PDF generation script is missing")
+        raise HTTPException(status_code=500, detail="PDF generation script is missing")
+
+    log_path = ROOT_DIR / "output" / job_id / "worker.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "ab")
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
-        update_job(job_id, status="processing", progress=10, message="Generating letters")
-        zip_path = generate_package(payload, output_dir_for(job_id))
-        update_job(
-            job_id,
-            status="completed",
-            progress=100,
-            message="Unable to Reach letter generated",
-            zip_path=str(zip_path),
-            error=None,
+        subprocess.Popen(
+            [sys.executable, str(JOB_SCRIPT), "--job-id", job_id],
+            cwd=str(ROOT_DIR),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
         )
     except Exception as exc:
-        logger.exception("Job %s failed", job_id)
-        update_job(
-            job_id,
-            status="failed",
-            progress=100,
-            message="Processing failed",
-            error=str(exc),
-            traceback=traceback.format_exc(),
-        )
+        log_file.close()
+        update_job(job_id, status="failed", progress=100, error=str(exc))
+        raise HTTPException(status_code=500, detail="Could not start PDF job") from exc
+    logger.info("Started PDF job script for %s", job_id)
 
 
-def _queue_job(background_tasks: BackgroundTasks, payload: dict[str, Any]) -> dict[str, str]:
+def _queue_job(payload: dict[str, Any]) -> dict[str, str]:
     job_id = uuid.uuid4().hex
-    create_job(job_id)
-    background_tasks.add_task(_run_job, job_id, payload)
+    create_job(job_id, payload)
+    _start_pdf_job(job_id)
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -95,7 +100,11 @@ def root() -> dict[str, Any]:
             "health": "http://localhost:8000/health",
             "docs": "http://localhost:8000/docs",
         },
-        "generate_letter": "POST /api/unable-to-reach-letter with form field data_json",
+        "endpoints": {
+            "POST": "/api/unable-to-reach-letter",
+            "GET_status": "/api/job-status/{job_id}",
+            "GET_download": "/api/download/{job_id}",
+        },
     }
 
 
@@ -106,29 +115,24 @@ def health() -> dict[str, str]:
 
 @app.post("/api/unable-to-reach-letter")
 async def unable_to_reach_letter(
-    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
     data_json: str = Form(
-        default=(
-            '{"firstName":"ABHINAV","lastName":"PULYANI","clientName":"PULYANI, ABHINAV",'
-            '"aNumber":"251566057","language":"hindi","addr_code":"add1"}'
-        ),
+        ...,
         description="JSON with firstName, lastName, aNumber, language, addr_code, date",
     ),
 ) -> dict[str, str]:
     _require_auth(authorization)
     payload = _parse_data_json(data_json)
-    return _queue_job(background_tasks, payload)
+    return _queue_job(payload)
 
 
 @app.post("/api/generate")
 def generate_letter_json(
     payload: LetterPayload,
-    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
 ) -> dict[str, str]:
     _require_auth(authorization)
-    return _queue_job(background_tasks, payload.model_dump())
+    return _queue_job(payload.model_dump())
 
 
 @app.get("/api/job-status/{job_id}")
@@ -152,10 +156,14 @@ def download(job_id: str, authorization: str | None = Header(default=None)):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job["status"] != "completed" or not job.get("zip_path"):
+    zip_path = job.get("zip_path")
+    if job["status"] != "completed" or not zip_path:
         raise HTTPException(status_code=409, detail="Job is not ready for download")
+    path = Path(zip_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Generated file not found")
     return FileResponse(
-        job["zip_path"],
+        path,
         media_type="application/zip",
         filename=f"{job_id}_unable_to_reach_letter.zip",
     )

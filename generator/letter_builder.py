@@ -15,7 +15,7 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
 
-from app.content import HEADER_OFFICES, LETTERS
+from generator.content import HEADER_OFFICES, LETTERS
 
 NAVY = RGBColor(0x1F, 0x4E, 0x79)
 

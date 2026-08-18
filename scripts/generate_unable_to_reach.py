@@ -1,20 +1,35 @@
+#!/usr/bin/env python3
+"""Generate the Unable to Reach letter PDF/Word package for one queued job.
+
+The API server only creates a job. This script does the work:
+
+    python scripts/generate_unable_to_reach.py --job-id <id>
+"""
+
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import re
+import sys
+import traceback
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from app.config import OUTPUT_DIR
-from app.content import LETTERS
-from app.letter_builder import build_combined_letter_docx
-from app.pdf_export import convert_docx_to_pdf
-from app.translator import transliterate_client_name
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
-logger = logging.getLogger(__name__)
+from app.jobs import get_payload, job_dir, update_job
+from generator.letter_builder import build_combined_letter_docx
+from generator.pdf_export import convert_docx_to_pdf
+from generator.translator import transliterate_client_name
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("generate_unable_to_reach")
 
 SUPPORTED_LANGUAGES = {"hindi", "punjabi"}
 
@@ -69,17 +84,17 @@ def normalize_payload(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def generate_package(data: dict[str, Any], job_dir: Path) -> Path:
+def generate_package(data: dict[str, Any], out_dir: Path) -> Path:
     payload = normalize_payload(data)
-    job_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     english_name = payload["clientName"]
     language = payload["language"]
     native_name = transliterate_client_name(english_name, language)
 
     stem = f"{payload['lastName']}_{payload['firstName']}_A_{payload['aNumber']}_unable_to_reach"
-    docx_path = job_dir / f"{stem}.docx"
-    pdf_path = job_dir / f"{stem}.pdf"
+    docx_path = out_dir / f"{stem}.docx"
+    pdf_path = out_dir / f"{stem}.pdf"
 
     build_combined_letter_docx(
         native_language=language,
@@ -93,7 +108,7 @@ def generate_package(data: dict[str, Any], job_dir: Path) -> Path:
     )
     pdf_file = convert_docx_to_pdf(docx_path, pdf_path)
 
-    zip_path = job_dir / f"{payload['firstName']}_A_{payload['aNumber']}_unable_to_reach_letter.zip"
+    zip_path = out_dir / f"{payload['firstName']}_A_{payload['aNumber']}_unable_to_reach_letter.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         if pdf_file and pdf_file.exists():
             zf.write(pdf_file, pdf_file.name)
@@ -115,11 +130,43 @@ def generate_package(data: dict[str, Any], job_dir: Path) -> Path:
     return zip_path
 
 
-def output_dir_for(job_id: str) -> Path:
-    path = OUTPUT_DIR / job_id
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+def run_job(job_id: str) -> None:
+    payload = get_payload(job_id)
+    if payload is None:
+        raise FileNotFoundError(f"No payload found for job {job_id}")
+
+    update_job(job_id, status="processing", progress=10, message="Generating letters")
+    zip_path = generate_package(payload, job_dir(job_id))
+    update_job(
+        job_id,
+        status="completed",
+        progress=100,
+        message="Unable to Reach letter generated",
+        zip_path=str(zip_path),
+        error=None,
+    )
 
 
-# Keep import used for language validation at runtime.
-assert "english" in LETTERS and "hindi" in LETTERS and "punjabi" in LETTERS
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate Unable to Reach letter for a job")
+    parser.add_argument("--job-id", required=True, help="Job id created by the API server")
+    args = parser.parse_args()
+    job_id = args.job_id.strip()
+    try:
+        run_job(job_id)
+        return 0
+    except Exception as exc:
+        logger.exception("Job %s failed", job_id)
+        update_job(
+            job_id,
+            status="failed",
+            progress=100,
+            message="Processing failed",
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

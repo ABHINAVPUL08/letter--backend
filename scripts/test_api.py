@@ -28,14 +28,16 @@ req = urllib.request.Request(
 res = json.loads(urllib.request.urlopen(req).read().decode())
 print("submit", res)
 job = res["job_id"]
-for _ in range(10):
+for _ in range(60):
     st = json.loads(
         urllib.request.urlopen(f"http://127.0.0.1:8000/api/job-status/{job}").read().decode()
     )
     print("status", st)
     if st["status"] in ("completed", "failed"):
         break
-    time.sleep(0.4)
+    time.sleep(1)
+if st["status"] != "completed":
+    raise SystemExit(f"job did not complete: {st}")
 out = Path.home() / "Downloads" / "unable_to_reach_test.zip"
 data = urllib.request.urlopen(f"http://127.0.0.1:8000/api/download/{job}").read()
 out.write_bytes(data)
